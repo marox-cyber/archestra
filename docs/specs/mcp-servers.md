@@ -435,8 +435,6 @@ The secret table (`backend/src/database/schemas/secret.ts`) supports three stora
 
 When a catalog item is edited, every installed `mcp_server` pointing at it must be reconciled with the new definition. The cascade is the algorithm that decides per-server whether to skip, mark-for-manual-reinstall, or auto-restart. It runs server-side as the source of truth, and is predicted client-side by the catalog edit form's confirm bar so the user can see the consequence of their save before they make it.
 
-> **Status note.** The backend cascade and its predicates (`cascadeReinstallForCatalog`, `requiresNewUserInputForReinstall`, `onlyForwardCompatibleEnvDiff`, `isMetadataOnlyEdit`) are live on `main`. The shared scenario matrix ([`shared/cascade-scenarios.ts`][shared-scenarios]) and the frontend mirror ([`cascade-decision.ts`][fe-cascade]) that this section describes land in [PR #4841][pr-4841] (draft as of writing). Until that lands, the frontend confirm bar uses a hand-rolled OR of dirty flags that does not consult the shared matrix; the backend gate is authoritative regardless.
-
 ### 10.1 Decision tree
 
 ```
@@ -496,11 +494,12 @@ Defined in [`backend/src/services/mcp-reinstall.ts`][svc-reinstall]; mirrored in
 Returns true (⇒ skip) iff *all* of the following hold:
 
 1. `promptedEnvVarsChanged` returns false (env-var schema evolution is forward-compatible);
-2. Non-prompted env-var entries are byte-identical (their values are part of the catalog template; any change must propagate to pods);
-3. `userConfigChangedBreakingly` returns false;
-4. No other non-metadata field differs.
+2. `promptedEnvVarsRuntimeChanged` returns false — currently the `mounted` flag on an existing prompted env var. Flipping `mounted` swaps the pod spec between an env-var injection and a mounted secret file at `/secrets/<key>`; the user supplied the same value at install, so it's not a re-prompt — but the layout is a runtime concern that needs a restart. This check is what routes such flips to `auto` instead of letting them slip into `skip`.
+3. Non-prompted env-var entries are byte-identical (their values are part of the catalog template; any change must propagate to pods);
+4. `userConfigChangedBreakingly` returns false;
+5. No other non-metadata field differs.
 
-The fourth check is the historically fragile one. The backend implementation compares JSON-stringified strip-results of two `InternalMcpCatalog` rows; this is safe because both sides are model-shaped. The frontend implementation, however, compares `initialValues` (raw API response shape) against `transformFormToApiData(values)` (route-input shape) — these have different field sets, so the frontend uses an **explicit projection** of cascade-relevant fields rather than strip-then-stringify. See §10.6.
+The fifth check is the historically fragile one. The backend implementation compares JSON-stringified strip-results of two `InternalMcpCatalog` rows; this is safe because both sides are model-shaped. The frontend implementation, however, compares `initialValues` (raw API response shape) against `transformFormToApiData(values)` (route-input shape) — these have different field sets, so the frontend uses an **explicit projection** of cascade-relevant fields rather than strip-then-stringify. See §10.6.
 
 ### 10.4 Schema evolution rules
 
@@ -525,7 +524,9 @@ The fourth check is the historically fragile one. The backend implementation com
 | `type` changed | breaking |
 | `headerName` changed | breaking (routing change) |
 | `sensitive` flipped | breaking (storage bucket moves) |
-| Pure metadata change (`title`, `description`, `default`, `valuePrefix`) | compatible |
+| `default` changed on a **prompted** header-mapped field (`promptOnInstallation` or `promptOnPreset` is true) | compatible (it's just the placeholder shown at install/preset time; the actual runtime value comes from user input) |
+| `default` changed on a **static** header-mapped field (both prompt flags false) | breaking → auto path (the form writes the admin's runtime header value into `userConfig[field].default` when `promptOnInstallation` is false; the next pod restart picks up the new value, no re-prompt) |
+| `title`, `description`, `valuePrefix` change | compatible (cosmetic) |
 
 ### 10.5 Parent edit vs preset edit
 
@@ -541,9 +542,7 @@ The fourth check is the historically fragile one. The backend implementation com
 - Only `presetFieldValues` is editable on a child row; the cascade visits every installed server whose `catalogId == child.id`.
 - Preset value changes never trip `requiresNewUserInputForReinstall` (the preset author is not the installer), so the outcome is always either `skip` or `auto`.
 
-### 10.6 Frontend mirror and the shape-mismatch gotcha (PR #4841)
-
-> Applies to the design landing in [PR #4841][pr-4841]. On the current `main` the frontend uses a hand-rolled OR of per-field dirty flags inside `mcp-catalog-form.tsx` instead of a separately-tested pure function.
+### 10.6 Frontend mirror and the shape-mismatch gotcha
 
 The catalog edit form's confirm-bar calls a pure `computeCascadeOutcome(prev, next, opts)` ([`cascade-decision.ts`][fe-cascade]) which mirrors the backend's gate. The contract is the shared scenario matrix in `cascade-scenarios.ts` — both sides assert against it.
 
@@ -743,8 +742,6 @@ These routes register with no `requiredEndpointPermissionsMap` entry (auth is ha
 
 ### Code
 
-> Files marked **PR #4841** are on the in-review feature branch only; the rest are on `main`.
-
 | Concern | File |
 |---|---|
 | Catalog table | [`backend/src/database/schemas/internal-mcp-catalog.ts`][schema-cat] |
@@ -755,10 +752,10 @@ These routes register with no `requiredEndpointPermissionsMap` entry (auth is ha
 | Enterprise-managed credentials | [`backend/src/types/enterprise-managed-credentials.ts`][types-emc] |
 | Shared config schemas (OAuth, LocalConfig, env vars) | [`shared/mcp-server-config.ts`][shared-config] |
 | Metadata-only fields | `shared/catalog-runtime-fields.ts` |
-| Cascade scenarios (contract) | [`shared/cascade-scenarios.ts`][shared-scenarios] *(PR #4841)* |
+| Cascade scenarios (contract) | [`shared/cascade-scenarios.ts`][shared-scenarios] |
 | Backend cascade gate | [`backend/src/services/mcp-reinstall.ts`][svc-reinstall] |
 | Backend cascade route hook | `backend/src/routes/internal-mcp-catalog.ts` |
-| Frontend cascade mirror | [`frontend/src/app/mcp/registry/_parts/cascade-decision.ts`][fe-cascade] *(PR #4841)* |
+| Frontend cascade mirror | [`frontend/src/app/mcp/registry/_parts/cascade-decision.ts`][fe-cascade] |
 | K8s runtime manager | [`backend/src/k8s/mcp-server-runtime/manager.ts`][runtime-manager] |
 | K8s deployment helper | [`backend/src/k8s/mcp-server-runtime/k8s-deployment.ts`][k8s-deployment] |
 | Access control map | [`shared/access-control.ts`][acl] |
@@ -789,7 +786,6 @@ These routes register with no `requiredEndpointPermissionsMap` entry (auth is ha
 [model-server]: ../../platform/backend/src/models/mcp-server.ts
 [routes-mcp-proxy]: ../../platform/backend/src/routes/mcp-proxy.ts
 [pr-4830]: https://github.com/archestra-ai/archestra/pull/4830
-[pr-4841]: https://github.com/archestra-ai/archestra/pull/4841
 [user-platform-mcp]: ../pages/platform-mcp.md
 [user-mcp-gateway]: ../pages/platform-mcp-gateway.md
 [user-mcp-auth]: ../pages/mcp-authentication.md
