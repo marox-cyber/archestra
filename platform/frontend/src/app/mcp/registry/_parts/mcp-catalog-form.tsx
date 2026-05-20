@@ -723,7 +723,7 @@ export function McpCatalogForm({
       const outcome = computeCascadeOutcome(
         (initialValues ?? {}) as CascadeSnapshot,
         transformFormToApiData(values) as CascadeSnapshot,
-        { affectedServerCount, labelsChanged: areLabelsChanged },
+        { affectedServerCount },
       );
       if (outcome !== "skip") {
         setPendingSubmit({ values, mode: outcome });
