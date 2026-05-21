@@ -1061,6 +1061,113 @@ describe("mcp server inspect route", () => {
     expect(connectAndGetToolsMock).not.toHaveBeenCalled();
   });
 
+  // Bug capture: reinstall of a LOCAL MCP server with a newly-added
+  // prompted plain_text env var stores the user-entered value in the
+  // K8s Secret bag but never updates `mcp_server.environmentValues`.
+  // On the next auto-redeploy (or any subsequent restart),
+  // `startServer` reconstructs the deployment env by:
+  //   1) overlaying `mcp_server.environmentValues` for plain prompted
+  //      values (added in #4709 to fix the install-time gap), and
+  //   2) reading secret-typed values from the install Secret bag.
+  // For plain prompted values added at reinstall time, neither source
+  // has the value: the install row's column was never updated
+  // (this bug), and the secret-typed-only filter at
+  // `manager.ts:226-231` drops plain values when loading from the
+  // Secret bag.
+  //
+  // End-user symptom: admin adds a new required prompted plain_text
+  // env var to a local catalog, clicks Reinstall on their install,
+  // enters the value in the dialog, pod restarts — but the new env
+  // var has no value in the pod (`kubectl exec ... env` shows it
+  // missing). All tool calls relying on the var fail.
+  //
+  // Live-reproduced today on SQL1 (personal install). The team-scope
+  // install on the same catalog had `environmentValues` populated
+  // (created via the install route) and worked correctly — the bug
+  // only bites installs whose subsequent state is touched only by
+  // the reinstall route.
+  //
+  // The mirror of the install-route fix at line 705-723 (build
+  // `installEnvironmentValues` from prompted plain values, persist
+  // via `McpServerModel.update`) is missing from the reinstall
+  // route. Adding it inside the existing
+  // `if (mcpServer.serverType === "local" && (envValues || ucValues))`
+  // block — after the secret update, before `McpServerModel.update(
+  // { localInstallationStatus: "pending" })` — would close this gap.
+  test.fails("[bug] reinstall of a local MCP server persists plain prompted env values into mcp_server.environmentValues", async ({
+    makeInternalMcpCatalog,
+    makeMcpServer,
+  }) => {
+    const catalog = await makeInternalMcpCatalog({
+      name: "Local Reinstall Plain Prompted Env",
+      serverType: "local",
+      localConfig: {
+        command: "node",
+        arguments: ["server.js"],
+        environment: [
+          {
+            key: "PROMPTED_PLAIN_VALUE",
+            type: "plain_text",
+            promptOnInstallation: true,
+            required: true,
+          },
+        ],
+        transportType: "streamable-http",
+        httpPort: 8080,
+        httpPath: "/mcp",
+      },
+    });
+    const mcpServer = await makeMcpServer({
+      ownerId: user.id,
+      catalogId: catalog.id,
+    });
+    // Simulate an install row that lacks `environmentValues` for the
+    // newly-added prompted var (mirrors the live-reproduced state on
+    // SQL1's personal install, which had `environment_values = {}`).
+    await db
+      .update(schema.mcpServersTable)
+      .set({ environmentValues: {} })
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+    await McpServerUserModel.assignUserToMcpServer(mcpServer.id, user.id);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/mcp_server/${mcpServer.id}/reinstall`,
+      payload: {
+        environmentValues: {
+          PROMPTED_PLAIN_VALUE: "user-entered-at-reinstall",
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+
+    const [updatedServer] = await db
+      .select()
+      .from(schema.mcpServersTable)
+      .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+    expect(updatedServer?.environmentValues).toMatchObject({
+      PROMPTED_PLAIN_VALUE: "user-entered-at-reinstall",
+    });
+
+    // Drain the route's setImmediate-deferred reinstall so background
+    // work doesn't leak into the next test (same hygiene pattern as
+    // the existing local-reinstall test above).
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const [serverRow] = await db
+        .select()
+        .from(schema.mcpServersTable)
+        .where(eq(schema.mcpServersTable.id, mcpServer.id));
+
+      if (serverRow?.localInstallationStatus !== "pending") {
+        break;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  });
+
   test("automatically retries protected remote MCP server installation with an exchanged enterprise-managed credential", async ({
     makeAccount,
     makeIdentityProvider,
